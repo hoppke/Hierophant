@@ -1,0 +1,1218 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+#Imported modules {{{
+from glob import glob
+from os import stat, getcwd, mkdir, system, putenv, getenv, path, chmod, unlink, popen, makedirs
+import tarfile, sre, sys, math, md5, os, types
+from string import atoi
+from shutil import copy, rmtree
+#}}}
+
+#basic directory definitions
+METADATA="/var/lib/hbs" #where package metadata will be registered
+HBS_DIR=getenv("HBS_HOME", path.join(getenv("HOME"),"hbs")) #per-user HBS work directory
+HBS_DONE=getenv("HBS_DONE", path.join(getenv("HOME"),"hbs/DONE"))
+HBS_PACKDIR=getenv("HBS_PACKDIR","/archiwa/HBS")
+FAKEROOT=getenv("HBS_FAKEROOT", "/var/tmp/hbs") #$DESTDIR
+
+#--- CLASSES DEFINITIONS ---
+# class Templates: handles global and per-user templates (/etc/hbs, ~/.hbs)
+# class Parser: parses *.plans, creates shellcodes
+# class Packager: creates the final package out of FAKEROOT and user scripts
+# 
+# The following ~700 lines could be moved to an external module.
+
+def notice(msg): #{{{
+	"""Prints a notice to the user, using bolded screen font."""
+	print("\033[1mNOTICE: "+msg+"\033[0m")
+#}}}
+
+def error(msg): #{{{
+	"""Prints fatal errors with red, visible fonts and aborts the interpreter."""
+	print("\033[31;1mERROR: "+msg+"\033[0m")
+	sys.exit(1)
+#}}}
+
+def my_putenv(var, val): #{{{
+	putenv(var,val)
+	if os.environ.has_key(var):
+		os.environ[var]=val
+	else:
+		os.environ.update({var: val})
+	#}}}
+
+class Templates: #{{{
+	"""Manages all HBS template config files.
+
+	This class offers filesystem paths to all HBS templates. It automatically
+	detects per-user versions (~/.hbs/*, if present ) and links to them."""
+
+	#template filenames
+	templates={
+	'BANFILE'   : 'ban',
+	'BUILDFILE' : 'build',
+	'PLANFILE'  : 'defaultplan',
+	'INSTFILE'  : 'inst',
+	'MODSFILE'  : 'mods',
+	'PREPFILE'  : 'prep',
+	'POSTFILE'  : 'post',
+	'DEPSFILE'  : 'deps',
+	'KEEPFILE'  : 'keep',
+	}
+	#template files
+	DEFAULTSDIR="/etc/hbs"
+	#per-user templates (they override /etc/hbs/*)
+	USER_CONFIG=path.join(getenv("HOME"),".hbs")
+	def __init__(self):
+		#per-user files should override the /etc/hbs defaults
+		for i in self.templates:
+			if path.exists(path.join(self.USER_CONFIG,self.templates[i])):
+				self.templates[i]=path.join(self.USER_CONFIG,self.templates[i])
+			else:
+				self.templates[i]=path.join(self.DEFAULTSDIR,self.templates[i]) 
+		my_putenv("POST_SCRIPT",self.templates["POSTFILE"])
+		my_putenv("DEPS_SCRIPT",self.templates["DEPSFILE"])
+#}}}
+
+class Regexp: #{{{
+	"""Container class for regexp data. Also counts matches."""
+
+	counter=None #holds "usage counts". Equals '-1' when disabled.
+	regexp_line=None #original regexp string passed
+	owner=None
+	group=None
+	mode=None
+	compiled_regexp=None #compiled sre regexp object
+	def __init__(self, regexp, counter=True, extra_data=False):
+		"""regexp = regexp string, with starting and closing quotes
+		counter = boolean, if False usage counting will be disabled (permanently -1)
+		extra_data = if True, 'regexp' will be treated as a [mods] entry.
+		'owner', 'group' and 'mode' fields of this class will be set accordingly."""
+
+		self.regexp_line=regexp
+		if counter:
+			self.counter=0
+		else:
+			self.counter=-1
+		if extra_data:
+			temp=regexp.split(":",3)
+			self.mode=atoi(temp[0],8)
+			self.owner=temp[1].strip()
+			self.group=temp[2].strip()
+			temp[3]=(temp[3].strip())[1:-1]
+			self.compiled_regexp=sre.compile(temp[3])
+		else:
+			self.compiled_regexp=sre.compile(regexp.strip()[1:-1])
+
+	def match(self, text):
+		if self.compiled_regexp.match(text):
+			if self.counter!=-1: self.counter=self.counter+1
+			return True
+		else:
+			return False
+#}}}
+
+class Parser: #{{{
+	"""This class parses a PLAN file and translates it into shellcode.
+
+	This class parses a PLAN file, stripping comments and all-whitespace lines.
+	The resulting text is split into numerous *_section arrays. They can then be
+	read directly if need arises. The class also offers the eval_* family
+	of methods, which take a section and translate it into shellcode HBS files."""
+
+	body=[] #raw body of a plan file
+	planfile=None #plan filesystem path
+	pkgdir=None #plan directory
+	shellcode=None  #"BUILD" within plan directory
+	pkgname=None #name
+	pkgsummary=None #summary line
+	pkgversion=None #version
+	pkgrevision=None #revision (aka release)
+	info_section=None #[info]
+	inst_section=None #[inst]
+	files_section=None #[files]
+	build_section=None #[build]
+	prep_section=None #[prep]
+	mods_section=None #[mods]
+	ban_section=None #[ban]
+	keep_section=None #[keep]
+	vars_section=None #[vars]
+	DEFAULTS=None #dictionary with default template mappings
+	error=None #If Parser fails, this should be set to containt an error string.
+
+	def __init__(self, planfile,DEFAULTS): #{{{
+		"""Initialization of the Parser.
+
+		Arguments: a plan file and a templates dictionary."""
+
+		ignored_lines=sre.compile("^\s*(#.*)*$")
+		section_header=sre.compile("\s*\[\+?\w+\+?]\s*$")
+		info_re=sre.compile("^\s*\[info\]\s*$")
+		files_re=sre.compile("^\s*\[files\]\s*$")
+		inst_re=sre.compile("^\s*\[(\+inst|inst|inst\+)\]\s*$")
+		prep_re=sre.compile("^\s*\[(\+prep|prep|prep\+)\]\s*$")
+		build_re=sre.compile("^\s*\[(\+build|build|build\+)\]\s*$")
+		mods_re=sre.compile("^\s*\[mods\]\s*$")
+		ban_re=sre.compile("^\s*\[ban\+?\]\s*$")
+		keep_re=sre.compile("^\s*\[keep\]\s*$")
+		vars_re=sre.compile("^\s*\[vars\]\s*$")
+		
+		self.planfile=planfile
+		self.pkgdir, name=path.split(planfile)
+		my_putenv("PKG_DIR",self.pkgdir)
+		self.pkgname=name[:name.find(".plan")]
+		my_putenv("PKG_NAME",self.pkgname)
+		self.shellcode=path.join(self.pkgdir,"BUILD")
+		self.pkgscripts=path.join(self.pkgdir,"SCRIPTS")
+		self.DEFAULTS=DEFAULTS
+
+		file=open(planfile)
+		contents=file.readlines()
+		file.close()
+		for i in contents:
+			i=i.strip('\n')
+			if not ignored_lines.match(i): self.body.append(i)
+		marks=[]
+		for v,i in enumerate(self.body):
+			if section_header.match(i): marks.append(v)
+		#now "marks[]" contains line numbers of sections
+		sects=[]
+		z=len(marks)
+		for v,i in enumerate(marks):
+			if v+1!=z: sects.append((i,marks[v+1]))
+			else: sects.append((i,len(self.body)+1))
+		for v,i in sects:
+			section=self.body[v:i]
+			h=section[0]
+			if inst_re.match(h):
+				self.inst_section=section
+			elif info_re.match(h):
+				self.info_section=section
+			elif files_re.match(h):
+				self.files_section=section
+			elif prep_re.match(h):
+				self.prep_section=section
+			elif build_re.match(h):
+				self.build_section=section
+			elif ban_re.match(h):
+				self.ban_section=section
+			elif mods_re.match(h):
+				self.mods_section=section
+			elif keep_re.match(h):
+				self.keep_section=section
+			elif vars_re.match(h):
+				self.vars_section=section
+			else:
+				self.error="Unknown section '"+h+"' on line "+str(v)
+				break
+		#OK, the class now contains all sections, separated }}}
+
+	def do_cleanup(self,dest=""): #{{{
+		"""Clean up, removing temporary HBS files from self.shellcode.
+
+		It takes an optional argument - a directory name to remove from disk.
+		This argument can be used to remove $HBS_DESTDIR or $BUILDSUBDIR."""
+
+		notice("Cleaning up")
+		temp=glob(path.join(self.shellcode,".hbs_*"))
+		if temp:
+			for i in temp:
+				unlink(i)
+		if path.isdir(dest):
+			rmtree(dest)
+		#}}}
+
+	def eval_info(self): #{{{
+		"""Evaluate [info]. Sets important variables.
+
+		This method should be used before other eval_* methods. It performs basic
+		self.shellcode cleanups (and creates the self.shellcode directory if it's
+		missing). This method creates the .hbs_info file."""
+
+		self.pkgsummary, PKG_VERSION=self.info_section[1:3]
+		if PKG_VERSION.find("AUTO")==0:
+			if self.files_section!=None:
+				#[files] present. Take the first filename as basis
+				name_template=self.files_section[1]
+			else:
+				#scan through FILES/*
+				templates=[]
+				packs_re=sre.compile("(?i)^.*\.((tar\.(bz2|gz))|(tgz|tbz2))$")
+				for i in glob(path.join(self.pkgdir,"FILES")+"/*"):
+					if packs_re.match(i): templates.append(i)
+				notice("AUTO version found "+str(len(templates))+" result(s):")
+				for i in templates: notice("\t"+path.basename(i))
+				name_re=sre.compile("(?i).*"+sre.escape(self.pkgname)+".*")
+				temp2=[]
+				for i in templates:
+					if name_re.match(path.basename(i)):
+						temp2.append(i)
+				#So... There are 3 possibilities now:
+				#a. There was a single match. Yay!
+				#b. There were numerous matches. Yay! ;)
+				#c. Zero matches. Oh well, can't win them all.
+				if len(temp2)==1:
+					name_template=temp2[0]
+					notice("Chosen filename: "+path.basename(name_template))
+				elif len(temp2)>1:
+					temp.sort()
+					name_template=temp[0]
+					notice("More than one match. Choosing: "+path.basename(name_template))
+				#Well, we have a more or less randomly chosen filename ;)
+				#Now to find it once again and move it up front. Sorting the tail.
+				else:
+					error("AUTO version failed to find a candidate. Aborting...")
+			name_template=path.basename(name_template)
+			#Cool. We have a name. Now to rip the version out of it...
+			tail_re=sre.compile("(?i)^(.*)(-|_)(.*[0-9].*?)(\.|-|_)?(src|bin)?\.(tar|zip|tar\.gz|tgz|tar\.bz2)$")
+			results=tail_re.findall(name_template)
+			if (len(results)>0):
+				maybe_res=results[0][0]
+				results=results[0][2]
+			else:
+				#try something simpler
+				notice("AUTO failed to find a well-formed version string.")
+				notice("AUTO falls back to simpler procedures.")
+				tail_re=sre.compile("(?i)^(.*)(-|_)(.*?)(\.|-|_)?(src|bin)?\.(tar|zip|tar\.gz|tgz|tar\.bz2)$")
+				results=tail_re.findall(name_template)
+				if (len(results)>0):
+					maybe_res=results[0][0]
+					results=results[0][2]
+				else:
+					error("AUTO was inconclusive. Aborting...")
+			#Now check for complex versioning...
+			tail_re=sre.compile(".*(-|_)(.*)")
+			maybe_res=tail_re.findall(maybe_res)
+			if ((len(maybe_res)>0) and not (results.find(".")!=-1)):
+				notice("Source filename contains subversions... probably. Resampling.")
+				results=maybe_res[0][1]
+			tail_re=PKG_VERSION.find("-")
+			if (tail_re!=-1):
+				tail_re=PKG_VERSION[tail_re:]
+			else:
+				notice("AUTO defaulting release number to \"1\"")
+				tail_re="-1"
+			PKG_VERSION=results+tail_re
+			notice("AUTO established version: "+PKG_VERSION)
+		elif PKG_VERSION.find("PIPE:")==0:
+			temp=popen(PKG_VERSION[5:])
+			PKG_VERSION=(temp.read()).strip()
+			temp.close()
+		self.pkgversion, self.pkgrevision=PKG_VERSION.split("-",1)
+		my_putenv("PKG_SUMMARY",self.pkgsummary)
+		my_putenv("PKG_VERSION",self.pkgversion)
+		my_putenv("PKG_REVISION",self.pkgrevision)
+		file=open(path.join(self.shellcode, ".hbs_info"),"w")
+		file.write(self.pkgname+"-"+self.pkgversion+"-"+self.pkgrevision+"\n"+self.pkgsummary+"\n")
+		file.close()
+		#}}}
+
+	def eval_files(self): #{{{
+		"""Evaluate [files].
+
+		This method tries to find all source files (tarballs, patches etc.).
+		It uses a user-supplied [files] section OR some automagical procedures.
+		This method will create a .hbs_patch shellcode and set environment
+		variables used later by [prep]."""
+
+		patches_re=sre.compile("(?i)^.*\.(patch|diff)(\.bz2|\.gz)?$")
+		forced_patches_re=sre.compile("^[0-9]+:.+$")
+		packs_re=sre.compile("(?i)^.*\.((tar\.(bz2|gz))|(tgz|tbz2))$")
+		gzipped_re=sre.compile("(?i)^.*\.gz$")
+		bziped_re=sre.compile("(?i)^.*\.bz2$")
+		url_re=sre.compile("(?i)^(http|https|ftp)://(~?[a-zA-Z0-9_-]+/?)+")
+		PATCHES=[]
+		PATCHLEVELS=[]
+		RESTFILES=[]
+		GET_COMMANDS=[]
+		SOURCES=[]
+		FILES=path.join(self.pkgdir,"FILES")
+		my_putenv("FILES",FILES)
+		self.omit_files=[]
+
+		def invokepatch(patchfile, level=1):
+			if gzipped_re.match(patchfile):
+				return "gzip -dc "+patchfile+"|patch -p"+str(level)+"||error \"Patch failed: "+patchfile+"\""
+			elif bziped_re.match(patchfile):
+				return "bzip2 -dc "+patchfile+"|patch -p"+str(level)+"||error \"Patch failed: "+patchfile+"\""
+			else:	
+				return "patch -p"+str(level)+" <"+patchfile+"||error \"Patch failed: "+patchfile+"\""
+
+		if self.files_section!=None:
+			for k in self.files_section[1:]:
+				k=path.expandvars(k)
+				if forced_patches_re.match(k):
+					lev, fil=k.split(":",1)
+					PATCHLEVELS.append(lev)
+					if url_re.match(fil):
+						GET_COMMANDS.append("$HBS_WGET "+fil)
+						PATCHES.append(path.join(FILES,path.basename(fil)))
+						if options.omit_remote:
+							self.omit_files.append("'^"+sre.escape(path.expandvars(path.basename(self.pkgdir)+"/FILES/"+path.basename(fil)))+"$'")
+					else:
+						PATCHES.append(path.join(FILES,fil))
+				elif k.find("CVS:")==0:
+					GET_COMMANDS.append(k[4:].strip())
+				elif url_re.match(k):
+					GET_COMMANDS.append("$HBS_WGET "+k)
+					SOURCES.append(path.join(FILES,path.basename(k)))
+					if options.omit_remote:
+						self.omit_files.append("'^"+sre.escape(path.expandvars(path.basename(self.pkgdir)+"/FILES/"+path.basename(k)))+"$'")
+				else:
+					SOURCES.append(path.join(FILES,k))
+			if not SOURCES: error("Nothing found in FILES(?!) I quit!")
+			notice("SOURCES")
+			for k in SOURCES+RESTFILES: print path.basename(k)
+			if PATCHES:
+				notice("PATCHES:")
+				for k, p in zip(PATCHES,PATCHLEVELS): print path.basename(k), "-p"+str(p)
+			j=0
+			for k in SOURCES:
+				my_putenv("SOURCE"+str(j),k)
+				j+=1
+			for k in RESTFILES:
+				my_putenv("SOURCE"+str(j),k)
+				j+=1
+			if PATCHES:
+				patchscript=open(path.join(self.shellcode,".hbs_patch"),"w")
+				for k, p in zip(PATCHES,PATCHLEVELS):
+					patchscript.write(invokepatch(k,p)+"\n")
+				patchscript.close()
+			if GET_COMMANDS and options.perform_download:
+				if not path.exists(FILES):
+					mkdir(FILES)
+				getscript=open(path.join(self.shellcode,".hbs_get"),"w")
+				for k in GET_COMMANDS:
+					getscript.write(k+"\n")
+			SOURCE0=SOURCES[0]
+		else:
+			for i in glob(FILES+"/*"):
+				if packs_re.match(i): SOURCES.append(i)
+				elif patches_re.match(i): PATCHES.append(i)
+				else: RESTFILES.append(i)
+			
+			PATCHES.sort()
+			RESTFILES.sort()
+			#"SOURCES" have to be evaluated. The file that has the highest probability
+			#of being "the one" should be moved to the front. But just how the hell do
+			#you tell a "right" archive from a "wrong" archive? Well, a simple but fairly
+			#effective approach would be to search the filename for a version string.
+			#Oh, and don't bother guessing if SOURCES contain only one filename :)
+			
+			if len(SOURCES) > 1:
+				notice("Arcane heuristics enabled ;)")
+				version_re=sre.compile("(?i).*"+sre.escape(self.pkgversion)+".*")
+				temp=[]
+				for i in SOURCES:
+					if version_re.match(path.basename(i)):
+						temp.append(i)
+				#OK, now if temp contains any filenames...
+				if len(temp) > 1:
+					#More than 1, have to narrow it down. So, how about searching for
+					#the package name now? Huh? Whaddaya think?
+					notice("Version matching yields "+str(len(temp))+" results:")
+					for i in temp: notice("\t"+path.basename(i))
+					name_re=sre.compile("(?i).*"+sre.escape(self.pkgname)+".*")
+					temp2=[]
+					for i in temp:
+						if name_re.match(path.basename(i)):
+							temp2.append(i)
+					#So... There are 3 possibilities now:
+					#a. There was a single match. Yay!
+					#b. There were numerous matches. Yay! ;)
+					#c. Zero matches. Oh well, can't win them all.
+					if len(temp2)==1:
+						SOURCE0=temp2[0]
+						notice("Name matching cleared it: "+path.basename(SOURCE0))
+					elif len(temp2)==0 or len(temp2)>1:
+						temp.sort()
+						SOURCE0=temp[0]
+						notice("Name matching didn't help much, choosing the first matching file.")
+				#Well, we have a more or less randomly chosen filename ;)
+				#Now to find it once again and move it up front. Sorting the tail.
+					for v,i in enumerate(SOURCES):
+						if i==SOURCE0:
+							del SOURCES[v]
+							break
+					SOURCES.sort()
+					SOURCES.insert(0,SOURCE0)
+				elif len(temp)==1:
+					notice("Version matching was 100% successful")
+					SOURCE0=temp[0]
+					for v,i in enumerate(SOURCES):
+						if i==SOURCE0:
+							del SOURCES[v]
+							break
+					SOURCES.sort()
+					SOURCES.insert(0,SOURCE0)
+				elif len(temp)==0:
+					notice("Version matching failed completely :( Just what the hell did you gave me?")
+					#Now that's BAD. Version matching is of no use here.
+					#Argh. OK, try matching the filename now. And if THAT fails, choose
+					#a file at random.
+					name_re=sre.compile("(?i).*"+sre.escape(PKG_NAME)+".*")
+					for i in SOURCES:
+						if name_re.match(path.basename(i)): temp.append(i)
+					if len(temp)>=1:
+						notice("Name matching was a bit inconclusive, but that's better than nothing.")
+						temp.sort()
+						SOURCE0=temp[0]
+						for v,i in enumerate(SOURCES):
+							if i==SOURCE0:
+								del SOURCES[v]
+								break
+						SOURCES.sort()
+						SOURCES.insert(0,SOURCE0)
+					elif len(temp)==0:
+						#Nothing worked.
+						print """\033[34m
+						The Hierophant is unable to even remotely determine the function
+						of all the sources in FILES.
+						Dumb alphanumeric sorting will be used.\033[0m
+						"""
+						SOURCES.sort()
+						SOURCES0=SOURCES[0]
+						
+			elif len(SOURCES)==0:
+				error("Nothing found in FILES(?!) I quit.")
+			
+			notice("SOURCES")
+			for i in SOURCES+RESTFILES: print path.basename(i)
+			
+			if PATCHES:
+				notice("PATCHES")
+				patchscript=open(path.join(self.shellcode,".hbs_patch"),"w")
+				for i in PATCHES:
+					patchscript.write(invokepatch(i)+"\n")
+					print path.basename(i)
+				patchscript.close()
+			j=0
+			for i in SOURCES:
+				my_putenv("SOURCE"+str(j),i)
+				j+=1
+			for i in RESTFILES:
+				my_putenv("SOURCE"+str(j),i)
+				j+=1
+			SOURCE0=SOURCES[0] 
+		#}}}
+
+	def eval_build(self): #{{{
+		"""Evaluate [build]. Assemble .hbs_build shellcode
+
+		This method writes the .hbs_build script, the base for configuration
+		and compilation of sources."""
+
+		if self.build_section==None:
+			temp=path.join(self.shellcode,".hbs_build")
+			copy(path.join(self.DEFAULTS["BUILDFILE"]),temp)
+		else:
+			mode=self.build_section[0]
+			l=mode.find("[")+1
+			r=mode.rfind("]")
+			mode=mode[l:r]
+			file=open(path.join(self.shellcode,".hbs_build"),"w")
+			if mode[0]=="+":
+				#prepend
+				for j in self.build_section[1:]: file.write(j+'\n')
+				file2=open(self.DEFAULTS["BUILDFILE"])
+				tmp=file2.readlines()
+				file2.close()
+				file.writelines(tmp)
+			elif mode[-1:]=="+":
+				#append
+				file2=open(self.DEFAULTS["BUILDFILE"])
+				tmp=file2.readlines()
+				file2.close()
+				file.writelines(tmp)
+				for j in self.build_section[1:]: file.write(j+'\n')
+			else:
+				#replace
+				for j in self.build_section[1:]: file.write(j+'\n')		
+			file.close
+		#}}}
+
+	def eval_prep(self): #{{{
+		"""Evaluate [prep]. Assembles the .hbs_prep shellcode.
+
+		This method creates the .hbs_prep script which handles the initial
+		unpacking and patching of sources."""
+
+		if self.prep_section==None:
+			temp=path.join(self.shellcode,".hbs_prep")
+			copy(path.join(self.DEFAULTS["PREPFILE"]),temp)
+		else:
+			mode=self.prep_section[0]
+			l=mode.find("[")+1
+			r=mode.rfind("]")
+			mode=mode[l:r]
+			file=open(path.join(self.shellcode,".hbs_prep"),"w")
+			if mode[0]=="+":
+				#prepend
+				for j in self.prep_section[1:]: file.write(j+'\n')
+				file2=open(self.DEFAULTS["PREPFILE"])
+				tmp=file2.readlines()
+				file.writelines(tmp)
+				file2.close()
+			elif mode[-1:]=="+":
+				#append
+				file2=open(self.DEFAULTS["PREPFILE"])
+				tmp=file2.readlines()
+				file.writelines(tmp)
+				for j in self.prep_section[1:]: file.write(j+'\n')
+				file2.close()
+			else:
+				#replace
+				for j in self.prep_section[1:]: file.write(j+'\n')
+			file.close
+		#}}}
+
+	def eval_mods(self): #{{{
+		"""Evaluate [mods].
+
+		This method parses [mods] and RETURNS a compiled, internal HBS
+		representation of this section."""
+
+		file=open(self.DEFAULTS["MODSFILE"])
+		partial=[]
+		for i in file.readlines():
+			partial.append(Regexp(i.strip('\n'),False,True))
+		file.close()
+		if self.mods_section!=None:
+			for i in self.mods_section[1:]:
+				partial.append(Regexp(i.strip('\n'),True,True))
+		return partial
+		#}}}
+	
+	def eval_ban(self): #{{{
+		"""Evaluates [ban].
+
+		This method parses [ban] and RETURNS a compiled, internal HBS
+		representation of this section. It also writes the .hbs_ban file."""
+
+		partial=[]
+		if self.ban_section!=None:
+			mode=self.ban_section[0]
+			l=mode.find("[")+1
+			r=mode.rfind("]")
+			mode=mode[l:r]
+			if mode[-1:]=="+":
+				#append
+				file=open(self.DEFAULTS["BANFILE"])
+				bans=file.readlines()
+				file.close()
+				for j in bans:
+					partial.append(Regexp(j.strip('\n'),False,False))
+			for j in self.ban_section[1:]:
+				partial.append(Regexp(j.strip('\n'),True,False))
+				bans=self.ban_section[1:]
+		else:
+			file=open(self.DEFAULTS["BANFILE"])
+			bans=file.readlines()
+			file.close()
+			for j in bans:
+				partial.append(Regexp(j.strip('\n'),False,False))
+#This may seem strange, compared to eval_mods.
+#But this is actually a "optimization". As you see, I write ban expressions to a file.
+#What for? Well, it can be read by post-processing scripts. And they can use ban data to
+#skip postprocessing of banned files - that can save time.
+		file=open(path.join(self.shellcode,".hbs_ban"),"a")
+		for i in partial:
+			reg=i.regexp_line[1:-1]
+			file.write(reg+"\n")
+		file.close()
+		return partial
+		#}}}
+
+	def eval_keep(self): #{{{
+		"""Evaluate [keep].
+
+		This method parses [keep] and RETURNS a compiled, internal HBS
+		representation of this section."""
+
+		partial=[]
+		if self.keep_section==None:
+			file=open(self.DEFAULTS["KEEPFILE"])
+			keep=file.readlines()
+			file.close()
+			for i in keep:
+				partial.append(Regexp(i.strip('\n'),False,False))
+		else:
+			for i in self.keep_section[1:]:
+				partial.append(Regexp(i.strip('\n'),True,False)) 
+		return partial
+		#}}}
+
+	def eval_vars(self): #{{{
+		"""Evaluate [vars].
+
+		This method parses [vars] and RETURNS the appropriate shellcode.
+
+		The shellcode returned by this method is meant to be prepended to the
+		plan template. Due to the nature of [vars] the data returned here is
+		actually the raw content of self.vars_section, with the header line
+		stripped."""
+
+		if self.vars_section: return self.vars_section[1:]
+		#}}}
+
+	def eval_inst(self): #{{{
+		"""Evaluate [inst]. Assembles .hbs_inst shellcode.
+
+		This method creates the .hbs_inst scriptfile, which handles the
+		fakerooted "make install" phase."""
+
+		if self.inst_section==None:
+			temp=path.join(self.shellcode,".hbs_inst")
+			copy(path.join(self.DEFAULTS["INSTFILE"]),temp)
+		else:
+			mode=self.inst_section[0]
+			l=mode.find("[")+1
+			r=mode.rfind("]")
+			mode=mode[l:r]
+			file=open(path.join(self.shellcode,".hbs_inst"),"w")
+			if mode[0]=="+":
+				#prepend
+				for j in self.inst_section[1:]: file.write(j+'\n')
+				file2=open(self.DEFAULTS["INSTFILE"])
+				tmp=file2.readlines()
+				file.writelines(tmp)
+				file2.close()
+			elif mode[-1:]=="+":
+				#append
+				file2=open(self.DEFAULTS["INSTFILE"])
+				tmp=file2.readlines()
+				file.writelines(tmp)
+				for j in self.inst_section[1:]: file.write(j+'\n')
+				file2.close()
+			else:
+				#replace
+				for j in self.inst_section[1:]: file.write(j+'\n')
+			file.close
+		#}}}
+#}}}
+
+class Packager: #{{{
+	arch=None
+	destdir=None
+
+	def __init__(self,shellcode,destdir, mods, ban, keep, metadata, pkgname): #{{{
+		self.shellcode=shellcode
+		self.destdir=destdir
+		self.ban=ban
+		self.mods=mods
+		self.keep=keep
+		self.metadata=metadata
+		self.pkgname=pkgname
+		#}}}
+
+	def pack_files(self): #{{{
+		self.arch=tarfile.open(path.join(self.shellcode,".hbs_FILES.tar.gz"),"w:gz")
+		notice("Putting loose files into a tidy, gzipped tarball...")
+		FILELIST=open(path.join(self.shellcode,".hbs_files"),"w")
+		self.adddir(self.destdir,FILELIST)
+		self.arch.close()
+		FILELIST.close()
+		#}}}
+
+	def md5sum(self,file): #{{{
+		file=open(file,"r")
+		data=file.read()
+		file.close()
+		sum=md5.new()
+		sum.update(data)
+		return sum.hexdigest()
+		#}}}
+
+	def postprocess(self): #{{{
+		#Postprocess the package
+		pkgsize=0
+		info_files=[]
+		etc_files=[]
+		schemas_files=[]
+		GNUinfo_re=sre.compile("^usr/(share/)?info/.*\.info(\.gz)?$")
+		Schemas_re=sre.compile(".*\.schemas$")
+		for i in self.arch:
+			pkgsize+=math.ceil(i.size/4096.0)*4096
+			if GNUinfo_re.match(i.hbs_name) and (i.isreg() or i.islnk() or i.issym()):
+				info_files.append("/"+i.hbs_name)
+			elif Schemas_re.match(i.hbs_name) and (i.isreg() or i.islnk() or i.issym()):
+				schemas_files.append("/"+i.hbs_name)
+			elif i.isreg() or i.islnk():
+					for re in self.keep:
+						if re.match(i.hbs_name):
+							etc_files.append("/"+i.hbs_name)
+							break
+		
+		if info_files:
+			postin=open(path.join(self.shellcode,".hbs_postin"),"a")
+			preun=open(path.join(self.shellcode,".hbs_preun"),"a")
+			postin.write("\n#Registering Info files\nfor docfile in \\\n")
+			preun.write("\n#Unregistering Info files\nfor docfile in \\\n")
+			for i in info_files:
+				postin.write(i+" \\\n")
+				preun.write(i+" \\\n")
+				oneoffiles=i
+			infoindex=path.join(path.dirname(oneoffiles),"dir")
+			postin.write(";do\n/usr/bin/install-info ${docfile} "+infoindex+"\ndone\n")
+			preun.write(";do\n/usr/bin/install-info --delete ${docfile} "+infoindex+"\ndone\n")
+			postin.close()
+			preun.close()
+	
+		if schemas_files:
+			postin=open(path.join(self.shellcode,".hbs_postin"),"a")
+			postin.write("\n#Registering Gnome Schemas Files with GConf-2\n")
+			postin.write("for file in ")
+			for i in schemas_files:
+				postin.write(i+' ')
+			postin.write(";	do\nGCONF_CONFIG_SOURCE=`gconftool-2 --get-default-source` gconftool-2 --makefile-install-rule $file > /dev/null 2>&1; done")
+			postin.close()
+			preun=open(path.join(self.shellcode,".hbs_preun"),"a")
+			preun.write("\n#Removing Schemas from Gconf-2 Database\n")
+			preun.write("for file in ")
+			for i in schemas_files:
+				preun.write(i+' ')
+			preun.write("; do\nGCONF_CONFIG_SOURCE=`gconftool-2 --get-default-source` gconftool-2 --makefile-uninstall-rule $file > /dev/null 2>&1; done")
+			preun.close()
+		
+		if etc_files:
+			md5sums=open(path.join(self.shellcode,".hbs_md5"),"w")
+			for i in etc_files: md5sums.write(self.md5sum(path.normpath(self.destdir+i))+"  "+i+"\n")
+			md5sums.close()
+			postin=open(path.join(self.shellcode,".hbs_postin"),"a")
+			postin.write("\n#Restoring old config files from copies\nfor element in \\\n")
+			for i in etc_files: postin.write(i+" \\\n")
+			postin.write(";do\nif [ -e ${element}.hbs_saved ]; then\nmv ${element} ${element}.hbs_new\nmv ${element}.hbs_saved ${element}\nchown --reference=${element}.hbs_new ${element}\nchmod --reference=${element}.hbs_new ${element}\necho Old config restored, new one moved to ${element}.hbs_new\nfi\ndone\n")
+			postin.close()
+			preun=open(path.join(self.shellcode,".hbs_preun"),"a")
+			preun.write("\n#Making copies of modified configs\nfor element in `md5sum -c 2>/dev/null "+path.join(self.metadata,self.pkgname,"ETCMD5")+" |\\\nsed -n 's/^\\(.*\\): FAILED$/\\1/gp'`;do\ncp -p ${element} ${element}.hbs_saved\necho Config alteration detected. Saved as ${element}.hbs_saved\ndone\n")
+			preun.close() 
+
+		file=open(path.join(self.shellcode,".hbs_info"),"a")
+		file.write(str(int(pkgsize))+"\n")
+		file.close()
+		#}}}
+
+	def create_final(self,final): #{{{
+		notice("Writing Hierophant final package:\n\033[34m"+final+"\033[0m")
+		archfinal=tarfile.open(final,"w")
+		dict={
+		".hbs_files": "FILELIST",
+		".hbs_info": "INFO",
+		".hbs_postin": "POSTIN",
+		".hbs_postun": "POSTUN",
+		".hbs_prein": "PREIN",
+		".hbs_preun": "PREUN",
+		".hbs_reqs": "REQUIRES",
+		".hbs_provs": "PROVIDES",
+		".hbs_FILES.tar.gz": "FILES.tar.gz",
+		".hbs_md5": "ETCMD5",
+		}
+		for i in dict.keys():
+			file=path.join(self.shellcode,i)
+			remove_prefix=len(self.shellcode)
+			if path.exists(file):
+				rec=archfinal.gettarinfo(file,file[remove_prefix:])
+				rec.name=dict[rec.name]
+				rec.uname="root"
+				rec.gname="root"
+				rec.mode=0100644
+				plik=open(file,"r")
+				archfinal.addfile(rec,plik)
+				plik.close()
+		archfinal.close()
+		#}}}
+
+	def modattrs(self,file): #{{{
+		"""Modifies the file permissions of a tarinfo object."""
+		for mod in self.mods:
+			if mod.match(file.name):
+				file.uname=mod.owner
+				file.gname=mod.group
+				file.mode^=(file.mode&07777)
+				file.mode|=mod.mode
+				if file.isdir():
+					if mod.mode&0400:
+						file.mode|=0100
+					if mod.mode&0040:
+						file.mode|=0010
+					if mod.mode&0004:
+						file.mode|=0001
+		#}}}
+	
+	def judgement(self,suspect): #{{{
+		"""Checks if a file isn't banned."""
+		for i in self.ban:
+			if i.match(suspect):
+				return 1
+		return 0
+		#}}}
+	
+	def adddir(self,dirname,FILELIST): #{{{
+		"""Adds a given directory to an archive file."""
+		for i in glob(dirname+"/*")+glob(dirname+"/.*"):
+			newname=i[len(self.destdir):]
+			if path.isdir(i) and (i[-1:] != '/') and not path.islink(i): newname=newname+'/'
+			if not self.judgement(newname[1:]):
+				rec=self.arch.gettarinfo(i,newname)
+				self.modattrs(rec)
+				rec.hbs_name=newname[1:]
+				if rec.isdir():
+					rec.size=0
+					self.arch.addfile(rec)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+					FILELIST.write("%s:%s:%s:%s\n" %(modestr,rec.uname,rec.gname,newname))
+					self.adddir(i,FILELIST)
+				elif rec.isreg():
+					plik=open(i,"r")
+					self.arch.addfile(rec,plik)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+					FILELIST.write("%s:%s:%s:%s\n" %(modestr,rec.uname,rec.gname,newname))
+					plik.close()
+				else:
+					rec.size=0
+					self.arch.addfile(rec)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+					FILELIST.write("%s:%s:%s:%s\n" %(modestr,rec.uname,rec.gname,newname))
+			elif path.isdir(i): self.adddir(i,FILELIST)
+		#}}}
+
+	def issue_warnings(self): #{{{
+		"""Issue warnings concerning formal glitches detected while packaging"""
+		def warning(text,table):
+			print("\033[34;1mWARNING: "+text+"\033[0m")
+			for i in table:
+				print("\033[35;1m"+i+"\033[0m")
+			
+		for j in (mods, "[mods]"), (keep, "[keep]"), (ban, "[ban]"):
+			z=[]
+			for i in j[0]:
+				if i.counter==0:
+					z.append(i.regexp_line)
+			if z:
+				warning("expression(s) in "+j[1]+" found no match:",z)
+		#}}}
+#}}}
+
+class SourcePackager(Packager): #{{{
+	arch=None
+	destdir=None
+
+	def pack_files(self): #{{{
+		self.arch=tarfile.open(self.pkgname,"w")
+		self.adddir(self.destdir)
+		self.arch.close()
+		#}}}
+
+	def adddir(self,dirname): #{{{
+		"""Adds a given directory to an archive file."""
+		for i in glob(dirname+"/*")+glob(dirname+"/.*"):
+			newname=i[len(path.dirname(self.destdir)):]
+			if path.isdir(i) and (i[-1:] != '/'): newname=newname+'/'
+			if not self.judgement(newname[1:]):
+				rec=self.arch.gettarinfo(i,newname)
+				self.modattrs(rec)
+				if rec.isdir():
+					rec.size=0
+					self.arch.addfile(rec)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+					self.adddir(i)
+				elif rec.isreg():
+					plik=open(i,"r")
+					self.arch.addfile(rec,plik)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+					plik.close()
+				else:
+					rec.size=0
+					self.arch.addfile(rec)
+					modestr=oct(rec.mode)
+					modestr=modestr[-4:]
+			elif path.isdir(i) and not path.islink(i): self.adddir(i)
+		#}}}
+
+#}}}
+
+#--- REAL CODE STARTS HERE ---
+
+def restore_directory(archive):#{{{
+	arch=tarfile.open(archive, "r")
+	files=arch.getnames()
+	for i in files:
+		arch.extract(i, HBS_DIR)
+	arch.close()
+	#}}}
+
+#Option "parser" {{{
+class Options:
+	planfile=None
+	perform_download=False
+	restore_directory=False
+	build_binary=False
+	build_source=False
+	purge_builddir=False
+	omit_remote=False
+	omit_cleaning=False
+	skip_prep=False
+	skip_build=False
+	skip_inst=False
+	print_help=False
+
+	def __init__(self, args):
+		self.called_as=path.basename(args[0])
+		dict={
+			"-u": "restore_directory",
+			"-d": "perform_download",
+			"-o": "omit_remote",
+			"-bb": "build_binary",
+			"-bs": "build_source",
+			"-ba": ["build_source", "build_binary"],
+			"-purge": "purge_builddir",
+			"-noclean": "omit_cleaning",
+			"-noprep": "skip_prep",
+			"-nobuild": "skip_build",
+			"-noinst": "skip_inst",
+			"-h": "print_help",
+			"--help": "print_help",
+		}
+		
+		def get_plan_files(suspect):
+			"""Scans a directory, returns a plan filename (or None)"""
+			plan=glob(path.join(suspect,"*.plan"))
+			if plan:
+				return plan[0]
+			else:
+				return None
+			
+		for argv in args[1:]:
+			if argv in dict.keys():
+				if type(dict[argv]) == types.ListType:
+					for i in dict[argv]:
+						setattr(self,i,True)
+				else:
+					setattr(self,dict[argv],True)
+				if self.print_help: return #Abort on help request
+			else:
+				#This argument is invalid as an option.
+				plan=get_plan_files(path.realpath(argv))
+				if plan:
+					#a plan file
+					if not self.planfile: self.planfile=[]
+					self.planfile.append(plan)
+				else:
+					if self.restore_directory and path.isfile(argv):
+						if not self.planfile: self.planfile=[]
+						self.planfile.append(path.realpath(argv))
+					else:
+						error("argument "+argv+" is invalid.")
+		if not self.planfile:
+			plan=get_plan_files(path.realpath("."))
+			if not plan:
+				error("No plan file found!")
+			self.planfile=[plan]
+
+#}}}
+
+#parse CLI options
+options=Options(sys.argv)
+
+if options.print_help:
+	print """Valid options:
+-u package.hbs
+	Unpacks a given HBS source package into """+HBS_DIR+"""
+-d
+	Downloads all URLs and parses 'CVS:*' strings in [files]
+-bb [pkg_dir1 pkg_dir2 ...]
+	Starts the build process of a binary package.
+	Resulting *.hbi package will be placed in """+HBS_DONE+"""
+-bs [pkg_dir1 pkg_dir2 ...]
+	Assembles a source *.hbs package and places it in """+HBS_PACKDIR+"""
+-ba
+	'-bb' and '-bs' combined
+-o
+	Omit remote files when building source packages.
+	Files specified by URLs will not be included in *.hbs files.
+-noclean
+	After building packages skip the cleanup phase.
+	Temporary files (BUILD/.hbs*, /var/lib/hbs/*) won't be removed.
+-purge
+	Remove the whole BUILD/ subdirectory	
+-noprep
+	Skip the [prep] phase
+-nobuild
+	Skip the [build] phase
+-noinst
+	Skip the [inst] phase
+-h, --help
+	Display this help"""
+	sys.exit(0);
+
+my_putenv("HBS_DIR",HBS_DIR)
+
+if options.restore_directory:
+	for planfile in options.planfile:
+		notice("Unpacking source package: "+planfile)
+		restore_directory(planfile)
+	sys.exit(0)
+
+if options.skip_prep: my_putenv("HBS_SKIP_PREP","yes")
+if options.skip_build: my_putenv("HBS_SKIP_BUILD","yes")
+if options.skip_inst: my_putenv("HBS_SKIP_INST","yes")
+
+#handle templates
+defaults=Templates()
+
+for planfile in options.planfile:
+	
+	my_putenv("PLAN_FILE",planfile)
+	
+	#parse the plan file
+	plan=Parser(planfile,defaults.templates)
+	
+	if plan.error:
+		error(plan.error)
+	
+	#create the "BUILD" subdirectory
+	if not path.exists(plan.shellcode):
+		mkdir(plan.shellcode)
+		notice("Created the build directory")
+	
+	#evaluate all sections {{{
+	#TODO: add some error handling to Parser.eval_* methods and check
+	#plan.error after some sections.
+	plan.do_cleanup()
+	vars=plan.eval_vars()
+	plan.eval_info()
+	plan.eval_files()
+	plan.eval_prep()
+	plan.eval_build()
+	plan.eval_inst()
+	ban=plan.eval_ban()
+	keep=plan.eval_keep()
+	mods=plan.eval_mods()
+	#}}}
+	
+	#List of global variables available in a PLAN script: {{{
+	# $HBS_DIR - local (per-user) hbs directory, ~/.hbs/
+	# $HBS_DESTDIR - fakeroot, /var/tmp/hbs/package
+	# $PKG_DIR - package directory
+	# $BUILD_DIR - build directory
+	# $FILES - directory containing source files
+	# $PKG_NAME - package name
+	# $PKG_INFO - package summary
+	# $PKG_VERSION - package version
+	# $PKG_REVISION - package revision
+	# $SOURCE0 - main source file (tarball)
+	# $SOURCE1 - secondary source
+	# $SOURCE2 - tertiary source, etc.
+	# $PATCH0 - first patch
+	# $PATCH1 - second patch
+	# $PATCH2 - third patch
+	# $PL0 - "patch level" for the first patch
+	# $PL1 - "patch level" for the second patch
+	# $PL2 - "patch level" for the third patch
+	# $PLAN_FILE - self-explanatory
+	#}}}
+	
+	def build_binary(): #{{{
+		DESTDIR=path.join(FAKEROOT,plan.pkgname+"-"+plan.pkgversion+"-"+plan.pkgrevision)
+		my_putenv("HBS_DESTDIR",DESTDIR)
+	
+		#Initialize the packager
+		packager=Packager(plan.shellcode,DESTDIR,mods,ban,keep,METADATA,plan.pkgname)
+	
+		print "\033[1mName:\033[0m \t\t%s\n\033[1mVersion:\033[0m \t%s\n\033[1mRevision:\033[0m \t%s" \
+		% (plan.pkgname, plan.pkgversion, plan.pkgrevision)
+	
+		#Assemble the final PLAN script to be executed
+		file=open(plan.DEFAULTS["PLANFILE"])
+		default=file.readlines()
+		file.close()
+	
+		#Prepend [vars] to the PLAN script
+		file=open(path.join(plan.shellcode,".hbs_plan"),"w")
+		if vars!=None:
+			for i in vars:
+				file.write(i+"\n")
+		file.writelines(default)
+		file.close()
+		#Make the master PLAN script executable
+		chmod(file.name,0755)
+	
+		#Care to dance? Call the prep/build/inst shellcode (master PLAN script)
+		rc=system(path.join(plan.shellcode,".hbs_plan"))
+		if rc:
+			error("Build failed. I give up.")
+	
+		#Tell packager to pack fakeroot to a tarball
+		packager.pack_files()
+	
+		#Prepare post/pre(un)install scripts
+		dict={
+			"PREIN": ".hbs_prein",
+			"PREUN": ".hbs_preun",
+			"POSTIN": ".hbs_postin",
+			"POSTUN": ".hbs_postun",
+		}
+		for i in dict.keys():
+			if path.exists(path.join(plan.pkgscripts,i)):
+				temp=dict[i]
+				file=open(path.join(plan.shellcode,temp),"w")
+				file2=open(path.join(plan.pkgscripts,i),"r")
+				temp=file2.readlines()
+				file.writelines(temp)
+				file.close()
+				file2.close()
+	
+		#Postprocess package. Create postin scripts, count file sizes etc.
+		packager.postprocess()
+	
+		#Create destination directory for the final HBS package
+		temp=HBS_DONE
+		if not path.exists(temp):
+			makedirs(temp)
+			notice("Created directory "+temp)
+	
+		#create final *.hbi package
+		packager.create_final(path.join(HBS_DONE,plan.pkgname+"-"+plan.pkgversion+"-"+plan.pkgrevision+".hbi"))
+	
+		#clean up shellcode dir AND fakeroot
+		if not options.omit_cleaning:
+			plan.do_cleanup(DESTDIR)
+		packager.issue_warnings()
+		#End of build_binary
+		#}}}
+	
+	def build_source(): #{{{
+		DESTDIR=plan.pkgdir
+		name=path.join(HBS_PACKDIR,plan.pkgname+"-"+plan.pkgversion+"-"+plan.pkgrevision+".hbs")
+		base=path.basename(plan.pkgdir)
+		mods=[Regexp("0644:root:root:'.*'", False, True)]
+		ban=[Regexp("'^"+sre.escape(base)+"/(BUILD/.*|FILES/)$'", False, False)]
+		for i in plan.omit_files:
+			ban.append(Regexp(i, False, False))
+	
+		notice("Writing Hierophant source package:\n\033[34m"+name+"\033[0m")
+		
+		packager=SourcePackager(HBS_PACKDIR,DESTDIR,mods,ban,None,None,name)
+		packager.pack_files()
+	
+		#End of build_source
+		#}}}
+	
+	if options.build_binary:
+		build_binary()
+	if options.build_source:
+		build_source()
+	if not options.omit_cleaning:
+		if options.purge_builddir:
+			plan.do_cleanup(plan.shellcode)
+		else:
+			plan.do_cleanup()
+		
+	notice("All Done.")
+
+#vim modeline: vim:ts=4:sw=4:noet:fdm=marker:fcl=:si

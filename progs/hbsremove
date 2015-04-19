@@ -1,0 +1,156 @@
+#!/bin/sh
+HBS_DATABASE=/var/lib/hbs
+HBS_TMP=/tmp/.hbs_
+PKG_FILES="$@"
+ROOTDIR=/
+
+if hbshelper --terminal; then
+col_blue="\033[34;1m"
+col_off="\033[0m"
+col_bold="\033[1m"
+col_red="\033[31;1m"
+fi
+
+#Function prototypes
+notice () {
+printf "${col_bold}NOTICE: ${@}${col_off}\n"
+}
+
+do_cleanup () {
+#remove temporary files
+rm ${HBS_TMP}*
+}
+
+if ! hbshelper --check-uid; then
+notice "Insufficient privileges.\n\
+Sorry, but only \"root\" is allowed to run $(basename $0)."
+exit 0
+fi
+
+if [ ! -d "$HBS_DATABASE" ]; then
+echo "No database storage directory found ($HBS_DATABASE is missing)"
+echo "So there is no database, at least not yet. No can do, darling."
+echo "Goodbye :)"
+exit 0
+fi
+
+[ -z "$PKG_FILES" ] && { echo "You need to pass installed package name(s) as argument(s)"; exit 0; }
+
+if [ -e "${HBS_TMP}LOCK" ]; then
+echo "Lock file found. Aborting..."
+exit 1
+else
+echo > "${HBS_TMP}LOCK"
+fi
+
+#This part sets some important variables
+total_size=0
+c=0
+for i in $PKG_FILES; do
+pkgdir="${HBS_DATABASE}/${i%/}"
+PKG_DIRS="$PKG_DIRS $pkgdir"
+if [ ! -d "$pkgdir" ]; then
+	echo "No package named '$pkgdir' found! Aborting..."
+	do_cleanup
+	exit 1
+fi
+c=$(($c+1))
+p_size=$(hbshelper --print-lines 3-3 $pkgdir/INFO)
+total_size=$(( $total_size + $p_size ))
+NEW_FILELISTS="$NEW_FILELISTS ${pkgdir}/FILELIST"
+[ -e "$pkgdir/PROVIDES" ] && NEW_PROVIDES="$NEW_PROVIDES $pkgdir/PROVIDES"
+[ -e "$pkgdir/PREUN" ] && NEW_PREUN="$NEW_PREUN $pkgdir/PREUN"
+[ -e "$pkgdir/POSTUN" ] && NEW_POSTUN="$NEW_POSTUN $pkgdir/POSTUN"
+exclude="$exclude ${pkgdir}"
+done
+OLD_PKGS=$(hbshelper --get-pkgdirs "$HBS_DATABASE" $exclude)
+
+for i in $OLD_PKGS; do
+OLD_FILELISTS="$OLD_FILELISTS ${i}/FILELIST"
+[ -e "$i/PROVIDES" ] && OLD_PROVIDES="$OLD_PROVIDES $i/PROVIDES"
+[ -e "$i/REQUIRES" ] && OLD_REQUIRES="$OLD_REQUIRES $i/REQUIRES"
+done
+
+#OK, let's see if no deps get torn apart.
+
+if [ ! -z "$OLD_PROVIDES" -a ! -z "$OLD_REQUIRES" ]; then
+	sort -u $OLD_PROVIDES >${HBS_TMP}temp1
+	sort -u $OLD_REQUIRES >${HBS_TMP}temp2
+	if [ -s ${HBS_TMP}temp1 -a -s ${HBS_TMP}temp2 ]; then
+	sort -u ${HBS_TMP}temp1 ${HBS_TMP}temp2 >${HBS_TMP}temp3
+	sort ${HBS_TMP}temp3 ${HBS_TMP}temp1 |uniq -u >${HBS_TMP}broken
+	else >${HBS_TMP}broken
+	fi
+
+	if [ -s "${HBS_TMP}broken" ]; then
+	
+	if [ ! -z "$NEW_PROVIDES" ]; then
+	sort -u $NEW_PROVIDES > ${HBS_TMP}temp2
+	sort ${HBS_TMP}broken ${HBS_TMP}temp2|uniq -d > ${HBS_TMP}temp1
+	else > ${HBS_TMP}temp1
+	fi
+
+if [ -s "${HBS_TMP}temp1" ]; then
+echo You would break some dependencies:
+cat ${HBS_TMP}temp1 
+
+printf "\nPress 'y' and <ENTER> if you think that's OK. Any other choice aborts.\n\
+Your choice?: "
+read choice
+[ X"$choice" = Xy ] || {
+do_cleanup
+exit 1
+}
+fi #[ ! -s "${HBS_TMP}temp1" ]
+fi #[ ! -s "${HBS_TMP}broken" ]
+fi #[ ! -z "$OLD_PROVIDES" -a ! -z "$OLD_REQUIRES" ]
+
+#Now to check for filelist conflicts - conflicting files should not be
+#removed, as they are also part of some other package(s).
+
+if [ ! -z "$OLD_FILELISTS" ]; then
+hbshelper --cut-filelists $NEW_FILELISTS|sort -u >${HBS_TMP}temp1
+hbshelper --cut-filelists $OLD_FILELISTS|sort -u >${HBS_TMP}temp2
+sort ${HBS_TMP}temp1 ${HBS_TMP}temp2|uniq -d > ${HBS_TMP}conflicts
+
+sort ${HBS_TMP}temp1 ${HBS_TMP}conflicts|uniq -u > ${HBS_TMP}temp2
+else
+hbshelper --cut-filelists $NEW_FILELISTS|sort -u >${HBS_TMP}temp2
+fi
+
+#Now temp2 contains all the files to remove, minus those that appear in
+#other (not-marked-for-removal) packages.
+
+#Do PREUN scripts for removed packages
+[ ! -z "$NEW_PREUN" ]&& for i in $NEW_PREUN; do . "$i";done
+
+#Separate dirs from files, reverse sort dirs, remove files, remove dirs.
+if [ -s ${HBS_TMP}temp2 ]; then
+cat "${HBS_TMP}temp2" | hbshelper --dirs-show | sort -r > "${HBS_TMP}remove_dirs"
+cat "${HBS_TMP}temp2" | hbshelper --dirs-hide > "${HBS_TMP}remove_files"
+
+#Remove files
+if [ -s "${HBS_TMP}remove_files" ]; then
+	hbshelper --rm-from-list "${HBS_TMP}remove_files"
+fi
+if [ -s "${HBS_TMP}remove_dirs" ]; then
+	hbshelper --rmdir-from-list "${HBS_TMP}remove_dirs"
+fi
+
+fi #[ ! -s ${HBS_TMP}temp2 ]
+
+#Do POSTUN scripts for removed packages
+[ ! -z "$NEW_POSTUN" ]&& for i in $NEW_POSTUN; do . "$i";done
+
+#Now... remove old package metadata
+for i in $PKG_DIRS; do printf "rm -f ${i}/*\nrmdir ${i}\n";done > "${HBS_TMP}remove"
+. "${HBS_TMP}remove"
+
+do_cleanup
+total_size=$(hbshelper --size $total_size)
+if [ $c -gt 1 ]; then
+printf "Successfully removed ${col_blue}${total_size}${col_off} (${c} packages).\n"
+else
+printf "Successfully removed ${col_blue}${total_size}${col_off}.\n"
+fi
+

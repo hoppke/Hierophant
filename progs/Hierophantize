@@ -1,0 +1,30 @@
+printf "\033[34;1mHierophantizing RPM-ish database entries:\033[0m\n"
+for i in `rpm -qa --qf '%{NAME}\n'|sort -f`;do 
+
+printf "\033[1m%-20s:\033[0m " $i
+mkdir $i
+printf "filelist"
+rpm -q --qf '[%{FILEMODES:octal}:%{FILEUSERNAME}:%{FILEGROUPNAME}:%{FILENAMES}\n]' $i|sed -e 's/^40.*$/&\//g' -e 's/^[0-9]*\([0-9]\{4\}:.*$\)/\1/g' > $i/FILELIST
+printf " - requires"
+rpm -q $i --qf '[%{REQUIRENAME}\n]'|sed -n -e "/^\(\/.*\|rpmlib\)/d" -e "s/\./&/gp" > $i/REQUIRES
+
+printf " - provides"
+rpm -q $i --qf '[%{PROVIDENAME}\n]'|sed -n -e "/^\(\/.*\|rpmlib\)/d" -e "s/\./&/gp" > $i/PROVIDES
+
+printf " - scripts"
+rpm -q $i --qf '[%{PREIN}\n]' >$i/PREIN
+rpm -q $i --qf '[%{POSTIN}\n]' >$i/POSTIN
+rpm -q $i --qf '[%{PREUN}\n]' >$i/PREUN
+rpm -q $i --qf '[%{POSTUN}\n]' >$i/POSTUN
+
+printf " - info"
+rpm -q $i --qf '%{NAME}-%{VERSION}-%{RELEASE}\n%{SUMMARY}\n%{SIZE}\n%{INSTALLTIME}\n' >$i/INFO
+
+printf " - etcmd5"
+rpm -q --qf '[%{FILEMD5S}  %{FILENAMES}\n]' $i|egrep '^.*/(usr/|usr/local/)?etc/.*'|sed -n '/.\+  .\+/p'>$i/ETCMD5
+
+printf ".\n"
+
+for j in $i/*; do [ ! -s $j ] && rm $j; done
+
+done

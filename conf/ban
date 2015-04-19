@@ -1,0 +1,7 @@
+"^(bin|sbin|boot|dev|etc|home|lib|var|usr)/$"
+"^usr/(bin|sbin|lib|games|include|local|src|share)/$"
+"^usr/share/(doc|man|info|locale|aclocal|games)/$"
+"^usr/lib/pkgconfig/$"
+"^usr/share/man/man([0-9]|n)/$"
+"^var/(cache|lib|log|run|spool|games)/$"
+"^(var/)?tmp/.*$"

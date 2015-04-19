@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<mime-info xmlns='http://www.freedesktop.org/standards/shared-mime-info'>
+
+  <mime-type type="application/x-hbs">
+	<comment>Hierophant source package</comment>
+	<magic priority="50">
+      <match type="string" value="ustar\0" offset="257"/>
+      <match type="string" value="ustar\040\040\0" offset="257"/>
+    </magic>
+    <glob pattern="*.hbs"/>
+  </mime-type>
+
+  <mime-type type="application/x-hbi">
+	<comment>Hierophant compiled package</comment>
+	<magic priority="50">
+      <match type="string" value="ustar\0" offset="257"/>
+      <match type="string" value="ustar\040\040\0" offset="257"/>
+    </magic>
+    <glob pattern="*.hbi"/>
+  </mime-type>
+
+  <mime-type type="application/x-hbsplan">
+	<comment>Hierophant package plan</comment>
+    <glob pattern="*.plan"/>
+  </mime-type>
+
+</mime-info>
+

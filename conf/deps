@@ -1,0 +1,120 @@
+#!/usr/bin/python
+from os import getenv,popen
+from sre import compile
+
+PKG_DIR=getenv("PKG_DIR")
+
+# read list of binaries
+p=open(PKG_DIR+"/BUILD/.hbs_execslist","r")
+filelist=p.readlines()
+p.close()
+
+#generate a flat string
+flatlist=""
+for i in filelist: flatlist+=i
+flatlist=flatlist.replace("\n"," ")
+
+#read "file" results
+p=popen("file -b "+flatlist)
+filetypes=p.readlines()
+p.close()
+
+#filter shared ELF objects
+exec_re=compile(".*ELF.*shared")
+found=""
+for n,i in enumerate(filetypes):
+	if exec_re.match(i): found+=(filelist[n])
+found=found.replace("\n"," ")
+
+#scan them with objdump
+p=popen("objdump -p "+found)
+rawdeps=p.readlines()
+p.close()
+
+#find requires
+version_re=compile("^required from (.*):$")
+name_re=compile("^.* .* .* (.*)")
+empty_re=compile("^\s*$")
+need_re=compile(".*NEEDED +")
+key=""
+req_simple={}
+req_versioned={}
+for i in rawdeps:
+	i=i.strip()
+	match=need_re.split(i)
+	if (len(match)>1):
+		req_simple[match[1]]=1
+		continue
+	match=version_re.split(i)
+	if (len(match)==3):
+		key=match[1]
+		if not (req_versioned.has_key(key)): req_versioned[key]={}
+		continue
+	if (key==""): continue
+	if empty_re.match(i):
+		key=""
+		continue
+	req_versioned[key][name_re.split(i)[1]]=1
+
+#find provides
+version_re=compile("^1 .* .* (.*)$")
+name_re=compile("^[0-9]+ .* .* (.*)")
+empty_re=compile("^\s*$")
+soname_re=compile("^SONAME.* (.*)$")
+key=""
+prov_versioned={}
+prov_simple={}
+for i in rawdeps:
+	i=i.strip()
+	match=soname_re.split(i)
+	if (len(match)==3):
+		prov_simple[match[1]]=1
+		continue
+	match=version_re.split(i)
+	if ((len(match)==3) and (prov_simple.has_key(match[1]))):
+		key=match[1]
+		if not (prov_versioned.has_key(key)): prov_versioned[key]={}
+		continue
+	if (key==""): continue
+	if empty_re.match(i):
+		key=""
+		continue
+	if name_re.match(i):
+		prov_versioned[key][name_re.split(i)[1]]=1
+	else: prov_versioned[key][i]=1
+
+req=[]
+prov=[]
+
+# print requires
+# print versioned requires
+for i in req_versioned.keys():
+	for j in req_versioned[i].keys():
+		req.append(i+"("+j+")")
+
+# print plain requires
+for i in req_simple.keys(): req.append(i)
+
+for i in prov_versioned.keys():
+	for j in prov_versioned[i].keys():
+		prov.append(i+"("+j+")")
+# print plain requires
+for i in prov_simple.keys(): prov.append(i)
+
+#sort provides/requires
+prov.sort()
+req.sort()
+
+
+#dump prov/req lists to files
+if (prov):
+	p=open(PKG_DIR+"/BUILD/.hbs_provs","w")
+	for i in prov:
+		p.write(i+"\n")
+	p.close()
+if (req):
+	p=open(PKG_DIR+"/BUILD/.hbs_reqs","w")
+	for i in req:
+		p.write(i+"\n")
+	p.close()
+

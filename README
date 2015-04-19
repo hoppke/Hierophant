@@ -1,0 +1,61 @@
+Installation is simple: "make" and "make install".
+
+Files will, by default, be placed in /usr/bin and /etc/hbs,
+and directories /var/lib/hbs and /var/tmp/hbs will be created.
+
+You can set the $DESTDIR environment variable to install files in
+a different location.
+
+If the directory /usr/share/zsh/site-functions/ exists, a file named "_hbs"
+will be installed in it - it contains programmable completions for HBS
+utilities, so your Zsh should automagically learn how to complete things
+like "hbsremove" or "hieroq". Bash users can look in the "completion/bash"
+subdirectory for a (much simpler) version of completion rules for Bash and
+install them manually.
+
+The "contrib" directory contains some experimental scripts:
+1. draw.py - generates a SVG chart of installed packages. Unreadable "proof
+of concept", as I'm still trying to come up with a smart and human-readable
+layout. Status: useless
+
+2. reqs.py - can query packages, returning their "requires" in
+a user-friendly form. It translates dependencies into package names.
+Let's take gkrellm for example:
+If you run "hieroq -R gkrellm" you get something like this:
+
+libICE.so.6
+libSM.so.6
+libX11.so.6
+libatk-1.0.so.0
+libc.so.6
+libcrypto.so.0
+libdl.so.2
+libgdk-x11-2.0.so.0
+libgdk_pixbuf-2.0.so.0
+libglib-2.0.so.0
+libgmodule-2.0.so.0
+libgobject-2.0.so.0
+libgthread-2.0.so.0
+[...]
+
+But if you run "./reqs.py gkrellm" you could get this:
+
+gkrellm: XFree86, atk, glib, glibc, gtk+, openssl, pango
+
+And you can query multiple packages simultaneously:
+
+# ./reqs.py vorbis-tools xterm
+vorbis-tools: flac, glibc, libao, libogg, libvorbis, speex
+xterm       : XFree86, fontconfig, freetype2, glibc, ncurses, neXtaw, xft
+
+And if you run this script without any arguments it enters an "interactive"
+mode in which you can enter package names on the fly, with tab-completion
+and all. Unfortunately reqs.py performs quite a lot of data processing,
+so it takes some time to start up. To compensate for this I've implemented
+a special cache file, which speeds up the whole process enormously.
+
+This script will probably evolve into a separate HBS utility, maybe a "smart
+query" tool of some sort.
+
+
+-- Hoppke

@@ -1,0 +1,34 @@
+for i in $PWD/BUILD/*/; do
+notice "Will remove $i"
+rm -rf "$i"
+done
+
+if [ ! -d "$SOURCE0" ]; then
+
+echo $SOURCE0|grep -q 'gz$' && tarflags=xzf || tarflags=xjf
+notice "Unpacking $SOURCE0 in $PWD/BUILD"
+/bin/tar $tarflags "$SOURCE0" -C BUILD || error "FAILED TO UNPACK SOURCE!!!"
+
+else
+notice "Copying $SOURCE0 into $PWD/BUILD"
+mkdir -p "${PWD}/BUILD/${PKG_NAME}-${PKG_VERSION}-${PKG_REVISION}"
+cp -a $SOURCE0/*  "${PWD}/BUILD/${PKG_NAME}-${PKG_VERSION}-${PKG_REVISION}/"|| error "FAILED TO COPY SOURCE!!!"
+fi
+
+OLDCD=$PWD
+cd BUILD/*/
+export BUILDSUBDIR="$PWD"
+
+[ ! -z $EXTBUILDDIR ] && mkdir ../$EXTBUILDDIR
+
+if [ -e "$PATCHSCRIPT" ]; then
+if [ -z "$HBS_SKIP_PATCHES" ]; then
+notice "Applying patches:"
+. "$PATCHSCRIPT"
+else
+notice "Skipped patching sequence"
+fi
+fi
+
+cd $OLDCD
+

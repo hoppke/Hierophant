@@ -1,0 +1,4 @@
+Aby w³±czyæ dope³nianie dla poleceñ HBS w Bashu wystarczy zaimportowaæ plik
+"bashcomplete". Mo¿na np. jego zawarto¶æ dokleiæ do ~/.bashrc albo wpisaæ
+tam "source bashcomplete".
+

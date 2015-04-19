@@ -1,0 +1,160 @@
+#default functions
+notice () {
+printf "\033[1mNOTICE: ${@}\n\033[0m"
+}
+
+error () {
+printf "\n\033[31;1mFATAL ERROR: ${@}\n\033[0m"
+exit 1
+}
+
+#default variables
+PREFIX=${PREFIX:-"/usr"}
+BINDIR=${BINDIR:-"${PREFIX}/bin"}
+SBINDIR=${SBINDIR:-"${PREFIX}/sbin"}
+SYSCONFDIR=${SYSCONFDIR:-"/etc"}
+DATADIR=${DATADIR:-"${PREFIX}/share"}
+INCLUDEDIR=${INCLUDEDIR:-"${PREFIX}/include"}
+LIBDIR=${LIBDIR:-"${PREFIX}/lib"}
+LIBEXECDIR=${LIBEXECDIR:-"${LIBDIR}"}
+LOCALSTATEDIR=${LOCALSTATEDIR:-"/var"}
+MANDIR=${MANDIR:-"${PREFIX}/share/man"}
+INFODIR=${INFODIR:-"${PREFIX}/share/info"}
+DOCDIR=${DOCDIR:-"${DATADIR}/doc/${PKG_NAME}-${PKG_VERSION}"}
+export PREFIX
+export BINDIR
+export SBINDIR
+export SYSCONFDIR
+export DATADIR
+export INCLUDEDIR
+export LIBDIR
+export LIBEXECDIR
+export LOCALSTATEDIR
+export MANDIR
+export INFODIR
+export DOCDIR
+
+#defaults for ./configure
+CONFIGURE_DEFS=${CONFIGURE_DEFS:-"\
+--prefix=$PREFIX \
+--bindir=$BINDIR \
+--sbindir=$SBINDIR \
+--sysconfdir=$SYSCONFDIR \
+--datadir=$DATADIR \
+--includedir=$INCLUDEDIR \
+--libdir=$LIBDIR \
+--libexecdir=$LIBEXECDIR \
+--localstatedir=$LOCALSTATEDIR \
+--mandir=$MANDIR \
+--infodir=$INFODIR \
+--disable-dependency-tracking \
+"}
+export CONFIGURE_DEFS
+
+#defaults for make
+#MAKEALL_OPTS - not set by default, for use with special make targets
+#(e.g. for "make all docs" you could set MAKEALL_OPTS to "all docs")
+
+HBS_MAKE=${HBS_MAKE:-"make"}
+HBS_CONFIGURE=${HBS_CONFIGURE:-"configure"}
+HBS_WGET=${HBS_WGET:-"wget --passive-ftp --continue --tries=0"}
+MAKEINST_OPTS=${MAKEINST_OPTS:-"install DESTDIR=$HBS_DESTDIR"}
+export HBS_MAKE
+export HBS_CONFIGURE
+export MAKEINST_OPTS
+export HBS_WGET
+
+MAKE_DESTINST=${MAKEDESTINST_OPTS:-"$HBS_MAKE install \
+prefix=$HBS_DESTDIR$PREFIX \
+bindir=$HBS_DESTDIR$BINDIR \
+sbindir=$HBS_DESTDIR$SBINDIR \
+sysconfdir=$HBS_DESTDIR$SYSCONFDIR \
+datadir=$HBS_DESTDIR$DATADIR \
+includedir=$HBS_DESTDIR$INCLUDEDIR \
+libdir=$HBS_DESTDIR$LIBDIR \
+libexecdir=$HBS_DESTDIR$LIBEXECDIR \
+localstatedir=$HBS_DESTDIR$LOCALSTATEDIR \
+mandir=$HBS_DESTDIR$MANDIR \
+infodir=$HBS_DESTDIR$INFODIR \
+"}
+export MAKE_DESTINST
+
+
+PATCHSCRIPT="$PKG_DIR/BUILD/.hbs_patch"
+export PATCHSCRIPT
+GETSCRIPT="$PKG_DIR/BUILD/.hbs_get"
+export GETSCRIPT
+
+cd "$PKG_DIR"
+
+if [ -e "$GETSCRIPT" ]; then
+	notice "Getting sources:"
+	OLDCD=$PWD
+	cd FILES
+	. "$GETSCRIPT"
+	cd $OLDCD
+fi
+
+if [ -z "$HBS_SKIP_PREP" ]; then
+	notice "Executing [prep]..."
+	. "$PKG_DIR/BUILD/.hbs_prep"
+	[ $? -eq 0 ] || error "[prep] failed"
+else
+	notice "Skipped [prep]..."
+	for i in $PKG_DIR/BUILD/*/
+	do test X"`basename $i`" = X"$EXTBUILDDIR"&&continue
+	cd $i
+	export BUILDSUBDIR=$PWD
+	done
+fi
+
+if [ ! -z "$EXTBUILDDIR" ]; then
+	cd "$PKG_DIR/BUILD/$EXTBUILDDIR"
+		elif [ ! -z "$BUILDSUBDIR" ]; then
+		cd "$BUILDSUBDIR"
+	else cd "$PKG_DIR/BUILD"/*/
+	export BUILDSUBDIR="$PWD"
+fi
+
+if [ -z "$HBS_SKIP_BUILD" ]; then 
+	notice "Executing [build]..."
+	. "$PKG_DIR/BUILD/.hbs_build"
+	[ $? -eq 0 ] || error "[build] failed"
+else notice "Skipped [build]..."
+fi
+
+if [ -z "$HBS_SKIP_INST" ]; then
+	if [ -d "$HBS_DESTDIR" ]; then
+		notice "Will remove $HBS_DESTDIR"
+		rm -rf "$HBS_DESTDIR" || error "FAILED TO REMOVE OLD DESTDIR!!!"
+	fi
+	notice "Executing [inst]..."
+	. "$PKG_DIR/BUILD/.hbs_inst"
+	[ $? -eq 0 ] || error "[inst] failed"
+else notice "Skipped [inst]..."
+fi
+
+[ -x $HOME/.hbs/findexecs.py ] && 
+findexecs="$HOME/.hbs/findexecs.py" ||
+findexecs="/etc/hbs/findexecs.py"
+
+notice "Searching for executables ($findexecs)"
+python $findexecs "$HBS_DESTDIR" "$PKG_DIR/BUILD/.hbs_ban" > "$PKG_DIR/BUILD/.hbs_execslist"
+
+[ ! -s "$PKG_DIR/BUILD/.hbs_execslist" ] && rm "$PKG_DIR/BUILD/.hbs_execslist"
+
+if [ -z "$HBS_SKIP_POST" ]; then
+	notice "Postprocessing files."
+	. "$POST_SCRIPT" 
+	[ $? -eq 0 ] || error "Postprocessing failed"
+else notice "Skipped postprocessing..."
+fi
+
+if [ -z "$HBS_SKIP_DEPSGEN" ]; then
+	notice "Generating dependencies..."
+	if [ -s "$PKG_DIR/BUILD/.hbs_execslist" ]; then
+	python "$DEPS_SCRIPT"
+	fi
+else notice "Skipped generating dependencies..."
+fi
+

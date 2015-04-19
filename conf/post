@@ -1,0 +1,99 @@
+count="$PKG_DIR/BUILD/.hbs_count"
+[ -e "$count" ] && rm "$count"
+
+#Just in case...
+chmod u+wX -R "$HBS_DESTDIR"
+
+if [ -s "$PKG_DIR/BUILD/.hbs_execslist" ]; then
+
+notice "Stripping executable ELF binaries"
+cat "$PKG_DIR/BUILD/.hbs_execslist"|while read suspect;do
+x=`file $suspect|grep -v ' shared object,' | sed -n -e 's/^\(.*\):[  ]*ELF.*/\1/p'`
+if [ ! -z "$x" ]; then
+	strip -R .comment -R .note -R .note.ABI-tag $x
+	printf "."
+	printf "." >> "$count"
+fi
+done
+[ -e $count ] && echo \(`cat $count|wc -c`\)
+
+[ -e "$count" ] && rm "$count"
+notice "Stripping shared ELF *.so objects"
+grep '.*\.so\(\(\.[0-9]*\)*\)*' "$PKG_DIR/BUILD/.hbs_execslist"|while read suspect; do
+	x=`file $suspect | grep ' shared object,'|sed -n -e 's/^\(.*\):[  ]*ELF.*/\1/p'`
+if [ ! -z "$x" ]; then
+	strip -R .comment -R .note -R .note.ABI-tag $x
+	printf "."
+	printf "." >> "$count"
+fi
+done
+[ -e $count ] && echo \(`cat $count|wc -c`\)
+
+fi
+
+[ -e "$count" ] && rm "$count"
+notice "Stripping statically linked libraries (ar archives)"
+	for f in `find $HBS_DESTDIR -type f -name '*.a' -exec file {} \; | \
+	grep ' current ar archive'|sed -n -e 's/^\(.*\):[ ]*current ar archive.*/\1/p'`; do
+	strip -g -X -x $f || :
+	printf "."
+	printf "." >> "$count"
+done
+[ -e $count ] && echo \(`cat $count|wc -c`\)
+
+# Process libraries
+if [ -d $HBS_DESTDIR$LIBDIR ]; then
+	/sbin/ldconfig -n $HBS_DESTDIR$LIBDIR
+fi
+
+#and here do something about the man pages
+notice "Compressing man/info pages"
+oldcd="$PWD"
+cd $HBS_DESTDIR
+
+# Compress man pages
+COMPRESS="gzip -9"
+COMPRESS_EXT=.gz
+
+for d in ".$MANDIR" ".$INFODIR"; do
+    [ -d $d ] || continue
+    for f in `find $d -type f`
+    do
+	[ "`basename $f`" = "dir" ] && rm -f "$f" && continue
+
+	case "$f" in
+	 *.Z) gunzip $f; b=${f%.Z};;
+	 *.gz) gunzip $f; b=${f%.gz};;
+	 *.bz2) bunzip2 $f; b=${f%.bz2};;
+	 *) b=$f;;
+	esac
+
+	$COMPRESS $b </dev/null 2>/dev/null || {
+	    inode=`ls -i $b | awk '{ print $1 }'`
+	    others=`find $d -type f -inum $inode`
+	    if [ -n "$others" ]; then
+		for afile in $others ; do
+		    [ "$afile" != "$b" ] && rm -f $afile
+		done
+		$COMPRESS -f $b
+		for afile in $others ; do
+		    [ "$afile" != "$b" ] && ln $b$COMPRESS_EXT $afile$COMPRESS_EXT
+		done
+	    else
+		$COMPRESS -f $b
+	    fi
+	}
+    done
+
+    for f in `find $d -type l`
+    do
+	l=`ls -l $f | sed -e 's/.* -> //' -e 's/\.\(gz\|bz2\|Z\)$//'`
+	rm -f $f
+	b=`echo $f | sed -e 's/\.\(gz\|bz2\|Z\)$//'`
+	ln -sf $l$COMPRESS_EXT $b$COMPRESS_EXT
+    done
+done
+
+cd $oldcd
+unset oldcd
+

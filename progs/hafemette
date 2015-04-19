@@ -1,0 +1,50 @@
+#!/usr/bin/python
+import gtk, sre, urlparse, sys
+from os import path, system
+from glob import glob
+
+#sys.path.append("/home/grzegorz/projekty/hbs/progs")
+import requester
+
+stage_1=requester.Requester()
+stage_1.set_visibility(True)
+gtk.main()
+
+if not stage_1.completed: sys.exit(1)
+
+pkginfo=stage_1.pkginfo
+filename=stage_1.tarball
+
+unpacker=requester.Unpacker(filename,pkginfo[0])
+
+if not unpacker.completed: sys.exit(1)
+
+unpacker.unpack()
+
+if not unpacker.completed: sys.exit(1)
+    
+confgui=requester.Scanner(unpacker.configure,pkginfo[0]+"-"+pkginfo[1])
+stage_1.set_visibility(False)
+confgui.set_visibility(True)
+
+gtk.main()
+
+if not confgui.completed: sys.exit(1)
+
+tmp=glob(path.join(unpacker.directory,"*"))[0]
+
+plan=requester.Editor(pkginfo, unpacker.tarball, tmp)
+plan.set_visibility(True)
+
+gtk.main()
+
+if not plan.completed: sys.exit(0)
+
+plan.write_plan(confgui.hbs_data)
+unpacker.cleanup()
+
+if plan.xterm: system("cd "+plan.finaldir+"; xterm&")
+
+#print confgui.raw_data
+
+

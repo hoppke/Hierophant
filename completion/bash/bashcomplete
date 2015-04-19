@@ -1,0 +1,26 @@
+_hieroq () {
+local cur
+cur=${COMP_WORDS[COMP_CWORD]}
+cd /var/lib/hbs/
+COMPREPLY=( $( compgen -G "$cur*") )
+}
+
+_hbsinst () {
+local cur
+cur=${COMP_WORDS[COMP_CWORD]}
+COMPREPLY=( $( compgen -G "$cur*.hbi") )
+}
+
+_hbspack () {
+local cur
+cur=${COMP_WORDS[COMP_CWORD]}
+if [[ "${COMP_WORDS[*]}" == *\ -u\ * ]]
+then
+COMPREPLY=( $( compgen -G "$cur*.hbs") )
+fi
+}
+
+complete -F _hieroq hieroq hbsremove
+complete -o dirnames -F _hbsinst hbsinst
+complete -o dirnames -F _hbspack hbspack
+

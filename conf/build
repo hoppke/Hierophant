@@ -1,0 +1,53 @@
+run_configure () {
+notice "Trying ./configure..."
+if [ -z "$EXTBUILDDIR" ]; then
+	notice "./$HBS_CONFIGURE ${CONFIGURE_DEFS} ${CONF_OPTS}"
+	./$HBS_CONFIGURE ${CONFIGURE_DEFS} ${CONF_OPTS}
+	status=$?
+else 
+	notice "$BUILDSUBDIR/$HBS_CONFIGURE ${CONFIGURE_DEFS} ${CONF_OPTS}"
+	$BUILDSUBDIR/$HBS_CONFIGURE ${CONFIGURE_DEFS} ${CONF_OPTS}
+	status=$?
+fi
+if [ $status -eq 0 ]; then
+	$HBS_MAKE $MAKEALL_OPTS || error "MAKE FAILED!!!"
+	else 
+	error "CONFIGURE FAILED!!!"
+fi
+}
+
+[ ! -z $EXTBUILDDIR ] && cd $PKG_DIR/BUILD/$EXTBUILDDIR || cd $BUILDSUBDIR
+
+
+if [ -x "$BUILDSUBDIR/$HBS_CONFIGURE" ]; then
+run_configure
+
+elif [ -x $BUILDSUBDIR/autogen.sh ]; then
+notice "Trying ./autogen.sh..."
+	$BUILDSUBDIR/autogen.sh ${CONFIGURE_DEFS} ${CONF_OPTS} &&
+	[ ! -e config.status ] && run_configure
+	$HBS_MAKE $MAKEALL_OPTS ||
+	error "AUTOGEN SEQUENCE FAILED!!!"
+
+elif [ -e $BUILDSUBDIR/aclocal.m4 -o -e $BUILDSUBDIR/configure.in -o -e $BUILDSUBDIR/configure.ac ];then
+notice "Trying aclocal/automake/autoconf chain..."
+	OLDCD=$PWD
+	cd $BUILDSUBDIR
+	aclocaldir=`find . -type d -name m4`
+	[ ! -z $aclocaldir ] && aclocaldir="-I $aclocaldir"
+	aclocal $aclocaldir &&
+	autoconf &&
+	autoheader&&
+	automake -af &&
+	cd $OLDCD &&
+	run_configure &&
+	$HBS_MAKE $MAKEALL_OPTS ||
+error "AUTORECONF SEQUENCE FAILED!!!"
+
+else
+	notice "Trying dumb make call"
+	echo $PWD
+	$HBS_MAKE $MAKEALL_OPTS ||
+error "DUMB MAKE INVOCATION FAILED!!!"
+
+fi

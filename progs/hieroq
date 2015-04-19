@@ -1,0 +1,89 @@
+#!/bin/sh
+PKGDIR=/var/lib/hbs
+unset _qf _qi _ql _qR _qdirs _qopts _qV _qa _file _package other
+
+if hbshelper --terminal; then	
+col_blue="\033[34;1m"
+col_bold="\033[;1m"
+col_off="\033[0m"
+fi
+
+print_help () {
+cmd=$(basename $0)
+echo "Usage:"
+echo "$cmd [-i] [-l] [-R] [-P] [-V] (-a | pkg1 [pkg2 pkg3 ...])"
+echo "$cmd -f file1 [file2 file3 ...]"
+}
+
+if [ "X$1" = "X" ]; then
+print_help
+exit 0
+fi
+
+if [ "X$1" = "X-f" ]; then
+	shift
+	hbshelper --grep-files "$PKGDIR" FILELIST $@
+	exit 0
+fi
+
+for i in $@; do 
+	if [ "X-i" = "X$i" ]; then _qi=1; _qopts=1
+	elif [ "X-l" = "X$i" ]; then _ql=1; _qopts=1
+	elif [ "X-R" = "X$i" ]; then _qR=1; _qopts=1
+	elif [ "X-P" = "X$i" ]; then _qP=1; _qopts=1
+	elif [ "X-V" = "X$i" ]; then _qV=1; _qopts=1
+	elif [ "X-a" = "X$i" ]; then _qa=1
+	elif [ "X-h" = "X$i" -o "X--help" = "X$i" ]; then
+		print_help
+		exit 0
+	elif [ -d ${PKGDIR}/$i ]; then
+	_qdirs="$_qdirs ${PKGDIR}/$i"
+	else 
+	other="$other $i"
+	fi
+done
+
+if [ ! "X$other" = "X" ]; then
+for i in ${other}; do echo Unknown package: $i;done
+exit 1
+fi
+
+if [ "X${_qR}${_qP}" = "X11" ]; then
+echo "-P and -R are mutually exclusive"
+exit 1
+fi
+
+if [ ! -z "$_qa" ]; then
+_qdirs=$(hbshelper --get-pkgdirs /var/lib/hbs)
+fi
+
+for i in $_qdirs; do
+	[ "X$_qV" = "X1" ] && break
+	if [ "X$_qi" = "X1" ]
+	then
+	printf "${col_blue}NAME: ${col_bold}$(hbshelper --print-lines 1-1 $i/INFO)\n"
+    printf "${col_blue}DESC:${col_off} $(hbshelper --print-lines 2-2 $i/INFO)\n"
+    printf "${col_blue}SIZE:${col_off} $(hbshelper --size $(hbshelper --print-lines 3-3 $i/INFO))\n"
+    printf "${col_blue}INST:${col_off} $(hbshelper --time $(hbshelper --print-lines 4-4 $i/INFO))\n"
+	fi
+	if [ "X$_qR" = "X1" -a -e $i/REQUIRES ]
+	then
+#		printf "${col_bold}Requires:${col_off}\n"
+		cat $i/REQUIRES
+	fi		
+	if [ "X$_qP" = "X1" -a -e $i/PROVIDES ]
+	then
+#		printf "${col_bold}Provides:${col_off}\n"
+		cat $i/PROVIDES
+	fi
+
+	[ "X$_ql" = "X1" ] && hbshelper --cut-filelists $i/FILELIST
+	[ -z "$_qopts" ] && hbshelper --print-lines 1-1 $i/INFO 
+done
+
+if [ "X$_qV" = "X1" ]
+then
+#	printf "${col_bold}Verification mode:${col_off}\n"
+	hbshelper --verify-packages ${_qdirs}
+fi
+

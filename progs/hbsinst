@@ -1,0 +1,339 @@
+#!/bin/sh
+#This script needs some external tools:
+#tar sort [ uniq sed mkdir rmdir
+
+#Global vars
+HBS_DATABASE=/var/lib/hbs
+HBS_DATABASE_NEW="${HBS_DATABASE}/_NEW_PACKAGES"
+HBS_TMP=/tmp/.hbs_
+PKG_FILES="$@"
+ROOTDIR=/
+
+if hbshelper --terminal; then
+col_blue="\033[34;1m"
+col_off="\033[0m"
+col_bold="\033[1m"
+col_red="\033[31;1m"
+fi
+
+#Function prototypes
+notice () {
+printf "${col_bold}NOTICE: ${@}${col_off}\n"
+}
+
+error () {
+printf "${col_red}FATAL ERROR: ${@}${col_off}\n"
+exit 1
+}
+
+do_cleanup () {
+#remove temporary files
+rm ${HBS_TMP}*
+[ -d "${HBS_DATABASE_NEW}" ] && rm -rf "${HBS_DATABASE_NEW}"
+}
+
+#Now this can be crucial in some cases, trust me :)
+export LC_ALL=C
+umask 0022
+
+if ! hbshelper --check-uid; then
+notice "Insufficient privileges.\n\
+Sorry, but only \"root\" is allowed to run $(basename $0)."
+exit 0
+fi
+
+if [ -z "$PKG_FILES" ]; then
+echo "You need to pass HBS Archive file(s) (*.hbi) as argument(s)"
+exit 1
+fi
+
+x=yes
+for i in $PKG_FILES; do
+if [ ! -e "$i" ]; then
+echo "Can't access package '$i'."
+x=no
+fi
+done
+
+if [ X"$x" = Xno ]; then
+echo Aborting.
+exit 1
+fi
+unset x
+
+#Modern GNU tar versions can get a speed bonus when unpacking
+#(via the --occurrence option)
+faster_untar="$(hbshelper --fast-tar)"
+
+if [ ! -d "$HBS_DATABASE" ]; then
+notice "Creating database storage directory in $HBS_DATABASE"
+mkdir -p "$HBS_DATABASE" || error "Couldn't create directory."
+fi
+
+
+if [ -e "${HBS_TMP}LOCK" ]; then
+error "HBS lock file found (${HBS_TMP}LOCK)."
+else
+echo > "${HBS_TMP}LOCK"
+fi
+
+#This part sets some important variables
+pkgcount=0
+total_size=0
+for i in $PKG_FILES; do
+
+tar xf "$i" -O $faster_untar INFO > ${HBS_TMP}pkginfo
+total_size=$(( $total_size + $(hbshelper --print-lines 3-3 ${HBS_TMP}pkginfo) ))
+
+pkgcount=$(($pkgcount+1))
+temp=$(hbshelper --print-lines 1-1 ${HBS_TMP}pkginfo)
+temp=${temp%-*-*}
+
+if [ -z "$temp" ]; then
+do_cleanup
+error "No valid INFO was found in $i. Not a HBS package?"
+fi
+
+pkgdir="${HBS_DATABASE_NEW}/${temp}"
+if ! mkdir -p "$pkgdir"; then
+do_cleanup
+error "Couldn't create temporary package directory in $pkgdir."
+fi
+
+if ! tar xmf "$i" --exclude="FILES.tar.gz" -C "$pkgdir"; then
+do_cleanup
+error "Couldn't unpack package metadata."
+fi
+
+NEW_FILELISTS="$NEW_FILELISTS $pkgdir/FILELIST"
+TIMESTAMPFILES="$TIMESTAMPFILES ${HBS_DATABASE}/${temp}/INFO"
+
+[ -e "$pkgdir/PROVIDES" ] && NEW_PROVIDES="$NEW_PROVIDES $pkgdir/PROVIDES"
+[ -e "$pkgdir/REQUIRES" ] && NEW_REQUIRES="$NEW_REQUIRES $pkgdir/REQUIRES"
+[ -e "$pkgdir/PREIN" ] && NEW_PREIN="$NEW_PREIN $pkgdir/PREIN"
+[ -e "$pkgdir/POSTIN" ] && NEW_POSTIN="$NEW_POSTIN ${HBS_DATABASE}/${temp}/POSTIN"
+
+NAMES="$NAMES $temp"
+PKG_DIRS="$PKG_DIRS $HBS_DATABASE/$temp"
+
+if [ -d "$HBS_DATABASE/$temp" ];then
+temp1="$HBS_DATABASE/$temp"
+[ -e "$HBS_DATABASE/$temp/PROVIDES" ] && REPLACED_PROVIDES="$HBS_DATABASE/$temp/PROVIDES"
+[ -e "$HBS_DATABASE/$temp/REQUIRES" ] && REPLACED_REQUIRES="$HBS_DATABASE/$temp/REQUIRES"
+OLD_PKGS="$OLD_PKGS $temp1"
+fi
+
+done
+rm ${HBS_TMP}pkginfo
+
+#look for inner conflicts
+temp=$(hbshelper --cut-filelists $NEW_FILELISTS|sort|uniq -d|hbshelper --dirs-hide)
+if [ ! -z "$temp" ]; then
+notice "Filename conflict detected:"
+printf "\nFiles named multiple times:\n"
+for i in $temp;do echo $i;done
+printf "\nPress 'y' and <ENTER> to ignore this. Any other choice aborts.\n\
+Your choice?: "
+read choice
+[ X"$choice" = Xy ] || {
+do_cleanup
+exit 1
+}
+fi
+
+#check dependency satisfaction
+
+OLD_PROVIDES=$(hbshelper --get-files "$HBS_DATABASE" PROVIDES $OLD_PKGS)
+OLD_REQUIRES=$(hbshelper --get-files "$HBS_DATABASE" REQUIRES $OLD_PKGS)
+
+if [ ! -z "$NEW_PROVIDES" -o ! -z "$OLD_PROVIDES" ]; then
+sort -u $NEW_PROVIDES $OLD_PROVIDES > ${HBS_TMP}tmp
+else
+echo > ${HBS_TMP}tmp
+fi
+sort -u ${HBS_TMP}tmp $NEW_REQUIRES > ${HBS_TMP}tmp2
+temp=`sort ${HBS_TMP}tmp2 $NEW_PROVIDES $OLD_PROVIDES|uniq -u`
+
+if [ ! -z "$temp" ]; then
+notice "Unresolved dependencies detected:"
+for i in $temp;do echo $i;done
+printf "\nPress 'y' and <ENTER> to ignore this. Any other choice aborts.\n\
+Your choice?: "
+read choice
+[ X"$choice" = Xy ] || {
+do_cleanup
+exit 1
+}
+fi
+
+#forgotten check - there is a remote possibility that upgrading will
+#actually break some dependencies.
+#find out which dependencies where being used outside of the package:
+if [ ! -z "$OLD_REQUIRES" -a ! -z "$REPLACED_PROVIDES" ]; then
+echo "* checking PROVIDES supplied with new package(s)"
+
+sort -u $OLD_REQUIRES > ${HBS_TMP}tmp
+sort -u $REPLACED_PROVIDES > ${HBS_TMP}tmp2
+sort ${HBS_TMP}tmp ${HBS_TMP}tmp2 | uniq -d > ${HBS_TMP}tmp3
+
+#now get the intersection with new provides
+if [ ! -z "$NEW_PROVIDES" ]; then
+sort -u $NEW_PROVIDES > ${HBS_TMP}tmp
+else
+echo > ${HBS_TMP}tmp
+fi
+sort ${HBS_TMP}tmp ${HBS_TMP}tmp3 | uniq -d > ${HBS_TMP}tmp2
+
+#and now check if they are the same (they should be, because that would mean
+#that the new package is able to satisfy at least all the deps that the old
+#package used to satisfy)
+sort ${HBS_TMP}tmp2 ${HBS_TMP}tmp3|uniq -u >${HBS_TMP}tmp
+temp=`cat ${HBS_TMP}tmp`
+
+#One more check: maybe those removed dependencies are also available in
+#different (already installed) packages?
+if [ ! -z "$OLD_PROVIDES" ]; then
+sort -u $OLD_PROVIDES > ${HBS_TMP}tmp2
+sort ${HBS_TMP}tmp2 ${HBS_TMP}tmp|uniq -d > ${HBS_TMP}tmp3
+#Now we have the list of doubled dependencies. Filter it once again to get
+#the "uniques".
+temp=`sort ${HBS_TMP}tmp3 ${HBS_TMP}tmp|uniq -u`
+fi
+
+if [ ! -z "$temp" ]; then
+notice "Dependency breach detected:\nReplacing some packages with new versions will break\nthese deps:\n"
+for i in $temp;do echo $i;done
+printf "\nPress 'y' and <ENTER> to allow this. Any any other choice aborts.\n\
+Your choice?: "
+read choice
+[ X"$choice" = Xy ] || {
+do_cleanup
+exit 1
+}
+fi
+
+fi #whole "upgrading breaks existing deps" check
+
+#check for conflicts with installed files
+echo "* checking for filename conflicts"
+hbshelper --cut-filelists $NEW_FILELISTS |sort|uniq|hbshelper --dirs-hide > ${HBS_TMP}filelists_new
+OLD_FILELISTS=$(hbshelper --get-files "$HBS_DATABASE" FILELIST $OLD_PKGS)
+
+echo > ${HBS_TMP}filelists_old
+if [ ! -z "$OLD_FILELISTS" ]; then
+hbshelper --cut-filelists $OLD_FILELISTS |sort|uniq|hbshelper --dirs-hide > ${HBS_TMP}filelists_old
+temp=`sort ${HBS_TMP}filelists_new ${HBS_TMP}filelists_old|uniq -d`
+
+if [ ! -z "$temp" ]; then
+notice "Filename conflict detected"
+printf "Some existing files will be overwritten if you continue:\n"
+for i in $temp;do echo $i;done
+printf "\nPress 'y' and <ENTER> to allow this. Any other choice aborts.\n\
+Your choice?: "
+read choice
+[ X"$choice" = Xy ] || {
+do_cleanup
+exit 1
+}
+fi
+
+fi # ! -z "$OLD_FILELISTS"
+
+#OK, if we got this far...
+#Do uninstall scripts for replaced packages
+if [ ! -z "$OLD_PKGS" ];then
+echo "* executing uninstall scripts"
+for i in $OLD_PKGS; do
+[ -e "$i/PREUN" ] && OLD_PREUN="$OLD_PREUN $i/PREUN"
+[ -e "$i/POSTUN" ] && OLD_POSTUN="$OLD_POSTUN $i/POSTUN"
+done
+
+if [ ! -z "$OLD_PREUN" ];then
+for i in $OLD_PREUN; do . "$i"; done
+fi
+
+if [ ! -z "$OLD_POSTUN" ];then
+for i in $OLD_POSTUN; do . "$i";done
+fi
+
+fi
+
+#Do PREIN scripts
+if [ ! -z "$NEW_PREIN" ];then
+for i in $NEW_PREIN; do . "$i";done
+fi
+
+#Install the files
+echo "* installing packaged files"
+for i in $PKG_FILES; do
+tar xmf "$i" -O $faster_untar FILES.tar.gz | tar xzf - -C "$ROOTDIR"
+if [ ! "$?" -eq 0 ]; then
+do_cleanup
+error "Errors while installing files. Possible data damage."
+fi
+done
+
+if [ ! -z "$OLD_PKGS" ]; then
+
+#When replacing existing packages some files can become orphans.
+#Find them.
+echo "* orphan hunt"
+temp=""
+for i in $OLD_PKGS;do temp="$temp ${i}/FILELIST";done
+hbshelper --cut-filelists $temp > ${HBS_TMP}filelists_obsoleted
+hbshelper --cut-filelists $NEW_FILELISTS |sort|uniq > ${HBS_TMP}filelists_new
+
+sort -u ${HBS_TMP}filelists_obsoleted ${HBS_TMP}filelists_new > ${HBS_TMP}tmp
+sort ${HBS_TMP}tmp ${HBS_TMP}filelists_new | uniq -u > ${HBS_TMP}tmp2
+sort ${HBS_TMP}tmp2 ${HBS_TMP}filelists_old | uniq -d > ${HBS_TMP}tmp
+sort -u ${HBS_TMP}tmp ${HBS_TMP}tmp2 > ${HBS_TMP}orphans
+
+if [ -s "${HBS_TMP}orphans" ]; then
+
+	#Separate dirs from files, sort directories so that nested ones come
+	#before their parents, remove newlines
+	cat "${HBS_TMP}orphans" | hbshelper --dirs-show | sort -r > "${HBS_TMP}orphaned_dirs"
+	cat "${HBS_TMP}orphans" | hbshelper --dirs-hide > "${HBS_TMP}orphaned_files"
+	if [ -s "${HBS_TMP}orphaned_files" ]; then
+		hbshelper --rm-from-list "${HBS_TMP}orphaned_files"
+	fi
+	if [ -s "${HBS_TMP}orphaned_dirs" ]; then
+		hbshelper --rmdir-from-list "${HBS_TMP}orphaned_dirs"
+	fi
+fi #[ -s "${HBS_TMP}orphans" ]
+fi #[ ! -z "$OLD_PKGS" ]
+
+#Now... remove old package metadata
+
+if [ ! -z "$OLD_PKGS" ]; then
+	for i in $OLD_PKGS
+		do printf "rm -f ${i}/*\nrmdir ${i}\n"
+	done > "${HBS_TMP}orphans"
+	. "${HBS_TMP}orphans"
+fi
+
+#Move new package metadata where it belongs
+mv "${HBS_DATABASE_NEW}/"*/ "${HBS_DATABASE}"
+rmdir "${HBS_DATABASE_NEW}"
+
+#run post-install scripts:
+if [ ! -z "$NEW_POSTIN" ];then
+echo "* executing postinst scripts"
+for i in $NEW_POSTIN; do . "$i"; done
+fi
+
+#add timestaps
+stamp=$(hbshelper --time)
+for i in $TIMESTAMPFILES; do echo $stamp >> "$i";done
+do_cleanup
+
+total_size=$(hbshelper --size $total_size)
+c=$pkgcount
+
+
+if [ $c -gt 1 ]; then
+printf "Successfully installed ${col_blue}${total_size}${col_off} (${c} packages).\n"
+else
+printf "Successfully installed ${col_blue}${total_size}${col_off}.\n"
+fi
+

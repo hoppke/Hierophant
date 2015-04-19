@@ -1,0 +1,5 @@
+[ ! -z $EXTBUILDDIR ] && cd $PKG_DIR/BUILD/$EXTBUILDDIR || cd $BUILDSUBDIR
+
+notice "Fakeroot install..."
+mkdir -p "$HBS_DESTDIR" && $HBS_MAKE $MAKEINST_OPTS || error "FAILED TO INSTALL!!!"
+

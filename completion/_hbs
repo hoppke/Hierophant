@@ -1,0 +1,52 @@
+#compdef hieroq hbsremove hbspack hbsinst
+local HBSDIR=$HOME/hbs
+local PKGDIR=/archiwa/HBS
+local context state line
+typeset -A opt_args
+case $service in
+hieroq)
+_arguments \
+'(--help -h)'{--help,-h}'[display hieroq help]' \
+'(-V)-i[display package info]' \
+'(-V)-l[display package contents]' \
+'(-V -P)-R[display package requirements]' \
+'(-V -R)-P[display package provides]' \
+'(-P -R -l -i)-V[verify package contents]' \
+'(*)-a[perform action on all installed packages]' \
+'*:package directory:_files -W /var/lib/hbs/ -/'
+return
+;;
+
+hbsremove)
+_arguments '*:package directory:_files -W /var/lib/hbs/ -/'
+return
+;;
+
+hbspack)
+_arguments \
+'(-h --help)'{-h,--help}'[display help]' \
+'(-u)-e[erase package directory after packing]:source directories:->pack' \
+'(-e)-u[unpack a .hbs file into $HBSDIR]:stored packages:->unpack' \
+'*:source directories:->rest'
+case $state in
+pack)
+_files -/
+;;
+unpack)
+_files -g "*.hbs"
+;;
+rest)
+[[ "$words" = *\ -u\ * ]] && _files -g "*.hbs" ||
+_files -/
+;;
+esac
+return
+;;
+
+hbsinst)
+_arguments '*:default packages:_files -g "*.hbi"'
+return
+;;
+
+esac
+
